@@ -1901,7 +1901,7 @@ template bool gemm_and_bias(
 using at::blas::ScalingType;
 using at::blas::SwizzleType;
 
-void scaled_gemm(
+bool scaled_gemm(
     char transa,
     char transb,
     int64_t m,
@@ -1932,7 +1932,11 @@ void scaled_gemm(
     const void* c_ptr,
     float beta,
     float alpha_multiplier,
-    const Tensor* device_beta) {
+    const Tensor* device_beta,
+    int64_t batch_count,
+    int64_t stride_a,
+    int64_t stride_b,
+    int64_t stride_result) {
   // Note: see `cublasCommonArgs` for various non-intuitive manipulations
   // of input arguments to this function.
   const auto computeType = CUBLAS_COMPUTE_32F;
@@ -2020,6 +2024,16 @@ void scaled_gemm(
   CuBlasLtMatrixLayout Cdesc(
       ScalarTypeToCudaDataType(c_desc_dtype), m, n, result_ld);
   CuBlasLtMatrixLayout Ddesc(ScalarTypeToCudaDataType(result_dtype), m, n, result_ld);
+  if (batch_count > 1) {
+    const auto count = c10::checked_convert<int32_t>(batch_count, "batch_count");
+    for (auto* desc : {&Adesc, &Bdesc, &Cdesc, &Ddesc}) {
+      desc->setAttribute(CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, count);
+    }
+    Adesc.setAttribute(CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, stride_a);
+    Bdesc.setAttribute(CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, stride_b);
+    Cdesc.setAttribute(CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, stride_result);
+    Ddesc.setAttribute(CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, stride_result);
+  }
   if (bias_ptr) {
     computeDesc.setAttribute(CUBLASLT_MATMUL_DESC_BIAS_POINTER, bias_ptr);
     computeDesc.setAttribute(CUBLASLT_MATMUL_DESC_EPILOGUE, CUBLASLT_EPILOGUE_BIAS);
@@ -2083,7 +2097,7 @@ void scaled_gemm(
   int returnedResult = 0;
   cublasLtHandle_t ltHandle = at::cuda::getCurrentCUDABlasLtHandle();
 
-  TORCH_CUDABLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
+  const auto heuristic_status = cublasLtMatmulAlgoGetHeuristic(
       ltHandle,
       computeDesc.descriptor(),
       Adesc.descriptor(),
@@ -2093,7 +2107,12 @@ void scaled_gemm(
       preference.descriptor(),
       1,
       &heuristicResult,
-      &returnedResult));
+      &returnedResult);
+  if (batch_count > 1 && (heuristic_status == CUBLAS_STATUS_NOT_SUPPORTED ||
+      (heuristic_status == CUBLAS_STATUS_SUCCESS && returnedResult == 0))) {
+    return false;
+  }
+  TORCH_CUDABLAS_CHECK(heuristic_status);
   if (returnedResult == 0) {
 #ifndef USE_ROCM
     TORCH_CUDABLAS_CHECK(CUBLAS_STATUS_NOT_SUPPORTED);
@@ -2192,7 +2211,7 @@ void scaled_gemm(
       computeType,
       " scaleType ",
       scaleType);
-  return;
+  return true;
 }
 
 void int8_gemm(

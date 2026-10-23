@@ -14,6 +14,8 @@
 #include <ATen/cuda/CUDABlas.h>
 #include <ATen/native/LinearAlgebraUtils.h>
 #include <ATen/native/ScaledBlasUtils.h>
+#include <ATen/native/ScaledBmmUtils.h>
+#include <limits>
 #include <ATen/native/cuda/ScaledBlasDeviceUtils.h>
 #include <ATen/cuda/tunable/Tunable.h>
 #include <ATen/cuda/tunable/TunableGemm.h>
@@ -37,6 +39,7 @@
 #include <ATen/ops/_efficientzerotensor.h>
 #include <ATen/ops/_scaled_addmm_native.h>
 #include <ATen/ops/_scaled_mm_native.h>
+#include <ATen/ops/_scaled_bmm_native.h>
 #include <ATen/ops/_scaled_mm_v2_native.h>
 #include <ATen/ops/abs.h>
 #include <ATen/ops/addmm_native.h>
@@ -621,6 +624,45 @@ _scaled_rowwise_rowwise(
 } // namespace
 
 
+Tensor& _scaled_bmm_out_cuda(const Tensor& self, const Tensor& mat2,
+    const Tensor& scale_a, const Tensor& scale_b,
+    const std::optional<Tensor>& bias, const std::optional<Tensor>& scale_result,
+    std::optional<ScalarType> out_dtype, bool use_fast_accum, Tensor& out) {
+#ifndef USE_ROCM
+  prepare_scaled_bmm_output(self, mat2, scale_a, scale_b, bias, scale_result, out_dtype, out);
+  const auto fp8 = [](ScalarType dtype) { return dtype == kFloat8_e4m3fn || dtype == kFloat8_e5m2; };
+  const auto aligned = [](const Tensor& t) { return reinterpret_cast<uintptr_t>(t.const_data_ptr()) % 16 == 0; };
+  const auto dtype = out.scalar_type();
+  if (scaled_mm_arch_allowed() && self.size(0) > 1 &&
+      self.size(0) <= std::numeric_limits<int32_t>::max() &&
+      self.size(1) > 0 && self.size(2) > 0 && mat2.size(2) > 0 &&
+      self.size(2) % 16 == 0 && mat2.size(2) % 16 == 0 &&
+      fp8(self.scalar_type()) && fp8(mat2.scalar_type()) &&
+      !(self.scalar_type() == kFloat8_e5m2 && mat2.scalar_type() == kFloat8_e5m2) &&
+      scale_a.numel() == 1 && scale_b.numel() == 1 && !bias && !scale_result &&
+      (dtype == kHalf || dtype == kBFloat16 || dtype == kFloat) &&
+      self.stride(2) == 1 && self.stride(1) >= self.size(2) && self.stride(1) % 16 == 0 &&
+      mat2.stride(1) == 1 && mat2.stride(2) >= mat2.size(1) && mat2.stride(2) % 16 == 0 &&
+      self.stride(0) % 16 == 0 && mat2.stride(0) % 16 == 0 && out.is_contiguous() &&
+      aligned(self) && aligned(mat2) && aligned(out)) {
+    const bool ran = at::cuda::blas::scaled_gemm(
+        't', 'n', mat2.size(2), self.size(1), self.size(2),
+        mat2.const_data_ptr(), scale_b.const_data_ptr(), mat2.stride(2), mat2.scalar_type(), kFloat,
+        ScalingType::TensorWise, SwizzleType::NO_SWIZZLE,
+        self.const_data_ptr(), scale_a.const_data_ptr(), self.stride(1), self.scalar_type(), kFloat,
+        ScalingType::TensorWise, SwizzleType::NO_SWIZZLE,
+        nullptr, dtype, out.data_ptr(), nullptr, out.stride(1), dtype, use_fast_accum,
+        std::nullopt, nullptr, 0.0f, 1.0f, nullptr,
+        self.size(0), mat2.stride(0), self.stride(0), out.stride(0));
+    if (ran) {
+      return out;
+    }
+  }
+#endif
+  return _scaled_bmm_out(self, mat2, scale_a, scale_b, bias, scale_result,
+      out_dtype, use_fast_accum, out);
+}
+
 // Computes matrix multiply + bias while applying scaling to input and output matrices
 // Scales are only applicable when matrices are of Float8 type and assumed to be equal to 1.0 by default.
 // If output matrix type is 16 or 32-bit type, scale_result is not applied.
@@ -640,6 +682,7 @@ _scaled_rowwise_rowwise(
 //    - `scale_result`: a scalar tensor with the scale of the output, only utilized if the output is a float8 type
 //    - `use_fast_accum`: if true, enables fast float8 accumulation. Backends may ignore this option if not applicable.
 //    - `out`: a reference to the output tensor
+
 
 Tensor&
 _scaled_mm_out_cuda(const Tensor& mat1, const Tensor& mat2,

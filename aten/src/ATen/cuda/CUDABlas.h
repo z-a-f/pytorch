@@ -161,7 +161,7 @@ void int8_gemm(
     int32_t* result_ptr,
     int64_t result_ld);
 
-void scaled_gemm(
+bool scaled_gemm(
     char transa,
     char transb,
     int64_t m,
@@ -193,7 +193,11 @@ void scaled_gemm(
     const void* c_ptr = nullptr,
     float beta = 0.0f,
     float alpha_multiplier = 1.0f,
-    const Tensor* device_beta = nullptr);
+    const Tensor* device_beta = nullptr,
+    int64_t batch_count = 1,
+    int64_t stride_a = 0,
+    int64_t stride_b = 0,
+    int64_t stride_result = 0);
 
 void grouped_gemm(
       char transa,

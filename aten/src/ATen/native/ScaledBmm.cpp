@@ -13,6 +13,7 @@
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/_scaled_bmm_native.h>
+#include <ATen/ops/_scaled_bmm.h>
 #include <ATen/ops/_scaled_bmm_v2_native.h>
 #include <ATen/ops/_scaled_mm_v2.h>
 #include <ATen/ops/empty_strided.h>
@@ -87,7 +88,6 @@ bool scale_matches(const Tensor& s, int64_t batch, bool batched,
     return false;
   }
   return s.scalar_type() == dtype && numel == expected;
-
 }
 
 std::pair<bool, bool> infer_scales(const Tensor& a, const Tensor& b,
@@ -176,10 +176,10 @@ std::vector<Tensor> batch_scales(TensorList scales, const std::vector<bool>& mod
 
 } // namespace
 
-Tensor& _scaled_bmm_out(const Tensor& self, const Tensor& mat2,
+std::pair<bool, bool> prepare_scaled_bmm_output(const Tensor& self, const Tensor& mat2,
     const Tensor& scale_a, const Tensor& scale_b,
     const std::optional<Tensor>& bias, const std::optional<Tensor>& scale_result,
-    std::optional<ScalarType> out_dtype, bool use_fast_accum, Tensor& out) {
+    std::optional<ScalarType> out_dtype, Tensor& out) {
   check_inputs(self, mat2, bias);
   const auto [batch_a, batch_b] = infer_scales(self, mat2, scale_a, scale_b);
   TORCH_CHECK(out.device() == self.device(), "out must be on the input device");
@@ -201,15 +201,29 @@ Tensor& _scaled_bmm_out(const Tensor& self, const Tensor& mat2,
     assert_no_overlap(out, *scale_result);
   }
   resize_output(out, {self.size(0), self.size(1), mat2.size(2)});
+  return {batch_a, batch_b};
+}
+
+Tensor& _scaled_bmm_out(const Tensor& self, const Tensor& mat2,
+    const Tensor& scale_a, const Tensor& scale_b,
+    const std::optional<Tensor>& bias, const std::optional<Tensor>& scale_result,
+    std::optional<ScalarType> out_dtype, bool use_fast_accum, Tensor& out) {
+  const auto [batch_a, batch_b] = prepare_scaled_bmm_output(
+      self, mat2, scale_a, scale_b, bias, scale_result, out_dtype, out);
   for (const auto i : c10::irange(self.size(0))) {
     auto output = out.select(0, i);
     auto bias_i = bias && bias->dim() == 2 ? std::optional<Tensor>(bias->select(0, i)) : bias;
     auto result_i = scale_result && scale_result->numel() != 1
         ? std::optional<Tensor>(scale_result->select(0, i)) : scale_result;
-    output.copy_(at::_scaled_mm(self.select(0, i), mat2.select(0, i),
+    auto batch_out = output.is_contiguous() ? output
+        : at::empty({self.size(1), mat2.size(2)}, out.options());
+    at::_scaled_mm_out(batch_out, self.select(0, i), mat2.select(0, i),
         batch_a ? scale_a.select(0, i) : scale_a,
         batch_b ? scale_b.select(0, i) : scale_b,
-        bias_i, result_i, out.scalar_type(), use_fast_accum));
+        bias_i, result_i, out_dtype, use_fast_accum);
+    if (!output.is_contiguous()) {
+      output.copy_(batch_out);
+    }
   }
   return out;
 }
@@ -219,8 +233,8 @@ Tensor _scaled_bmm(const Tensor& self, const Tensor& mat2,
     const std::optional<Tensor>& bias, const std::optional<Tensor>& scale_result,
     std::optional<ScalarType> out_dtype, bool use_fast_accum) {
   auto out = at::empty({0}, self.options().dtype(out_dtype.value_or(self.scalar_type())));
-  return _scaled_bmm_out(self, mat2, scale_a, scale_b, bias, scale_result,
-      out_dtype, use_fast_accum, out);
+  return at::_scaled_bmm_out(out, self, mat2, scale_a, scale_b, bias, scale_result,
+      out_dtype, use_fast_accum);
 }
 
 Tensor& _scaled_bmm_v2_out(const Tensor& self, const Tensor& mat2,
@@ -257,6 +271,12 @@ Tensor& _scaled_bmm_v2_out(const Tensor& self, const Tensor& mat2,
     assert_no_overlap(out, *bias);
   }
   resize_output(out, {self.size(0), self.size(1), mat2.size(2)});
+  if (self.is_cuda() && recipe_a.size() == 1 && recipe_b.size() == 1 &&
+      recipe_a[0] == 0 && recipe_b[0] == 0 && !modes_a[0] && !modes_b[0] &&
+      !bias && isFloat8Type(self.scalar_type()) && isFloat8Type(mat2.scalar_type())) {
+    return at::_scaled_bmm_out(out, self, mat2, scale_a[0], scale_b[0],
+        std::nullopt, std::nullopt, out.scalar_type(), use_fast_accum);
+  }
   for (const auto i : c10::irange(self.size(0))) {
     const auto bias_i = bias && bias->dim() == 2 ? std::optional<Tensor>(bias->select(0, i)) : bias;
     auto output = out.select(0, i);

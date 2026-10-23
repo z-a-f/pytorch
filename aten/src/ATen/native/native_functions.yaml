@@ -7119,7 +7119,8 @@
 - func: _scaled_bmm.out(Tensor self, Tensor mat2, Tensor scale_a, Tensor scale_b, Tensor? bias=None, Tensor? scale_result=None, ScalarType? out_dtype=None, bool use_fast_accum=False, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
   dispatch:
-    CPU, CUDA, XPU: _scaled_bmm_out
+    CPU, XPU: _scaled_bmm_out
+    CUDA: _scaled_bmm_out_cuda
   tags: needs_exact_strides
 
 - func: _scaled_bmm_v2(Tensor self, Tensor mat2, Tensor[] scale_a, int[] recipe_a, int[] swizzle_a, Tensor[] scale_b, int[] recipe_b, int[] swizzle_b, Tensor? bias, ScalarType? out_dtype, int[] contraction_dim=[], bool use_fast_accum=False) -> Tensor
