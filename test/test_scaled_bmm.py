@@ -95,6 +95,10 @@ class TestScaledBmmCUDA(TestScaledBmm):
     hw_classification = HardwareClassification.CUDA
 
 
+class TestScaledBmmXPU(TestScaledBmm):
+    hw_classification = HardwareClassification.XPU
+
+
 @instantiate_parametrized_tests
 class TestScaledBmmMeta(TestCase):
     hw_classification = HardwareClassification.GENERIC
@@ -124,6 +128,7 @@ class TestScaledBmmMeta(TestCase):
 
 instantiate_device_type_tests(TestScaledBmm, globals(), only_for=("cpu",))
 instantiate_device_type_tests(TestScaledBmmCUDA, globals(), only_for=("cuda",))
+instantiate_device_type_tests(TestScaledBmmXPU, globals(), only_for=("xpu",))
 
 if __name__ == "__main__":
     run_tests()
