@@ -243,6 +243,7 @@ scaled_dot_product_attention.
     SwizzleType
     grouped_mm
     scaled_mm
+    scaled_bmm
     scaled_addmm
     scaled_addmm_
     scaled_grouped_mm

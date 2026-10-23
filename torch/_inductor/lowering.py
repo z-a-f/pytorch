@@ -2866,6 +2866,8 @@ def unsupported_input_tensor(t: torch.Tensor, node=None):
                 aten.cat.default,
                 aten.clone.default,
                 aten._scaled_mm.default,
+                aten._scaled_bmm.default,
+                aten._scaled_bmm_v2.default,
                 aten._scaled_mm_v2.default,
                 aten._scaled_grouped_mm_v2.default,
                 prims.convert_element_type.default,
@@ -2887,6 +2889,8 @@ def unsupported_input_tensor(t: torch.Tensor, node=None):
             aten.cat.default,
             aten.clone.default,
             aten._scaled_mm.default,
+            aten._scaled_bmm.default,
+            aten._scaled_bmm_v2.default,
             aten._scaled_mm_v2.default,
             # MXFP8 grouped GEMM: the e8m0 scales are consumed by the kernel,
             # never read arithmetically by generated Triton.
@@ -4061,6 +4065,9 @@ make_fallback(aten._efficient_attention_forward.default, sdpa_constraint)
 make_fallback(aten._efficient_attention_backward.default, sdpa_constraint)
 
 # index_reduce requires fallback when use_scatter_fallback(...) returns True
+make_fallback(aten._scaled_bmm.default, constrain_to_fx_strides)
+make_fallback(aten._scaled_bmm_v2.default, constrain_to_fx_strides)
+
 make_fallback(aten.index_reduce)
 make_fallback(aten.repeat_interleave.Tensor, override_decomp=True)
 

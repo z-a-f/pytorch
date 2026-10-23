@@ -9707,6 +9707,20 @@ def error_inputs_triplet_margin_loss(op_info, device, **kwargs):
                          error_type=error_type, error_regex=error_regex)
 
 
+def sample_inputs_scaled_bmm(op_info, device, dtype, requires_grad, **kwargs):
+    input_dtype = e4m3_type if device.startswith("cuda") else dtype
+    for batch in (1, 3):
+        a = torch.randn(batch, 16, 32, device=device).to(input_dtype)
+        b = torch.randn(batch, 48, 32, device=device).to(input_dtype).transpose(1, 2)
+        for batched in (False, True):
+            sa = torch.ones((batch,) if batched else (), device=device)
+            sb = torch.ones((), device=device)
+            if op_info.name.endswith("_v2"):
+                yield SampleInput(a, args=(b, [sa], [0], [], [sb], [0], [], None, torch.bfloat16))
+            else:
+                yield SampleInput(a, args=(b, sa, sb), kwargs={"out_dtype": torch.bfloat16})
+
+
 def sample_inputs_scaled_mm(op_info, device, dtype, requires_grad, **kwargs):
     def to_fp8_saturated(x: torch.Tensor, fp8_dtype: torch.dtype) -> torch.Tensor:
         max_val = E4M3_MAX_POS if fp8_dtype == e4m3_type else E5M2_MAX_POS
@@ -17359,6 +17373,25 @@ op_db: list[OpInfo] = [
                 }),
                 'TestUnaryUfuncs', device_type='cuda',
             ), ],
+    ),
+    *(
+        OpInfo(
+            name,
+            sample_inputs_func=sample_inputs_scaled_bmm,
+            dtypes=custom_types(torch.float8_e4m3fn),
+            dtypesIfMPS=custom_types(torch.float8_e4m3fn) if name.endswith("_v2") else empty_types(),
+            supports_out=True,
+            supports_forward_ad=False,
+            supports_autograd=False,
+            decorators=[skipCUDAIf(not PLATFORM_SUPPORTS_FP8, "Requires FP8 support")],
+            skips=(
+                DecorateInfo(unittest.skip("Float8 output comparison helpers are unsupported"), "TestCommon", "test_out"),
+                DecorateInfo(unittest.skip("Float8 schema comparison helpers are unsupported"), "TestSchemaCheckModeOpInfo", "test_schema_correctness"),
+                DecorateInfo(unittest.skip("No batching rule"), "TestVmapOperatorsOpInfoDevice", "test_op_has_batch_rule"),
+                DecorateInfo(unittest.skip("No batching rule"), "TestVmapOperatorsOpInfoDevice", "test_vmap_exhaustive"),
+            ),
+        )
+        for name in ("torch._scaled_bmm", "torch._scaled_bmm_v2")
     ),
     OpInfo(
         'torch._scaled_mm_v2',

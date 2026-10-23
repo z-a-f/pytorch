@@ -179,8 +179,50 @@ class TestScaledBmmMeta(TestCase):
             self.assertEqual(result.dtype, torch.bfloat16)
 
 
+class TestScaledBmmCompile(TestCase):
+    hw_classification = HardwareClassification.CPU
+
+    @parametrize("v2", [False, True])
+    def test_compile_dynamic(self, device, v2):
+        from torch._dynamo.testing import CompileCounterWithBackend
+
+        def fn(a, b, sa, sb):
+            if v2:
+                return torch._scaled_bmm_v2(a, b, [sa], [0], [], [sb], [0], [], None, torch.bfloat16)
+            return torch._scaled_bmm(a, b, sa, sb, out_dtype=torch.bfloat16)
+
+        counter = CompileCounterWithBackend("inductor")
+        compiled = torch.compile(fn, backend=counter, fullgraph=True, dynamic=True)
+        for batch, m, k, n in ((2, 16, 32, 48), (4, 48, 64, 80)):
+            a = torch.randn(batch, m, k, device=device).to(torch.float8_e4m3fn)
+            b = torch.randn(batch, n, k, device=device).to(torch.float8_e4m3fn).transpose(1, 2)
+            sa = torch.rand(batch, device=device)
+            sb = torch.ones((), device=device)
+            self.assertEqual(compiled(a, b, sa, sb), fn(a, b, sa, sb))
+        self.assertEqual(counter.frame_count, 1)
+
+    @parametrize("v2", [False, True])
+    def test_export(self, device, v2):
+        class ScaledBmm(torch.nn.Module):
+            def forward(self, a, b, sa, sb):
+                if v2:
+                    return torch._scaled_bmm_v2(a, b, [sa], [0], [], [sb], [0], [], None, torch.bfloat16)
+                return torch._scaled_bmm(a, b, sa, sb, out_dtype=torch.bfloat16)
+
+        a = torch.randn(3, 32, 32, device=device).to(torch.float8_e4m3fn)
+        b = torch.randn(3, 48, 32, device=device).to(torch.float8_e4m3fn).transpose(1, 2)
+        sa = torch.rand(3, device=device)
+        sb = torch.ones((), device=device)
+        batch = torch.export.Dim("batch", min=2, max=8)
+        exported = torch.export.export(ScaledBmm(), (a, b, sa, sb), dynamic_shapes=({0: batch}, {0: batch}, {0: batch}, {}))
+        args = (a[:2], b[:2], sa[:2], sb)
+        self.assertEqual(exported.module()(*args), ScaledBmm()(*args))
+
+
 instantiate_device_type_tests(TestScaledBmm, globals(), except_for=("mps",), allow_xpu=True)
 instantiate_device_type_tests(TestScaledBmmV2, globals(), allow_mps=True, allow_xpu=True)
+
+instantiate_device_type_tests(TestScaledBmmCompile, globals(), only_for=("cpu",))
 
 if __name__ == "__main__":
     run_tests()
