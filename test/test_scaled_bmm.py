@@ -179,8 +179,8 @@ class TestScaledBmmMeta(TestCase):
             self.assertEqual(result.dtype, torch.bfloat16)
 
 
-instantiate_device_type_tests(TestScaledBmm, globals(), except_for=("mps", "xpu"))
-instantiate_device_type_tests(TestScaledBmmV2, globals(), except_for=("mps", "xpu"))
+instantiate_device_type_tests(TestScaledBmm, globals(), except_for=("mps",), allow_xpu=True)
+instantiate_device_type_tests(TestScaledBmmV2, globals(), except_for=("mps",), allow_xpu=True)
 
 if __name__ == "__main__":
     run_tests()
