@@ -7534,6 +7534,64 @@ def _check_scaled_mm_sizes(
     return torch.empty(self.size(0), mat2.size(1), dtype=_out_dtype, device=self.device)
 
 
+def _scaled_bmm_check_inputs(a, b, bias):
+    torch._check(a.dim() == 3 and b.dim() == 3, lambda: "_scaled_bmm inputs must be 3D")
+    torch._check(a.size(0) == b.size(0), lambda: "_scaled_bmm inputs must have the same batch size")
+    torch._check(a.size(2) == b.size(1), lambda: "_scaled_bmm contraction dimensions must match")
+    torch._check(a.device == b.device, lambda: "_scaled_bmm inputs must be on the same device")
+    torch._check(a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz) and b.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz), lambda: "_scaled_bmm inputs must be Float8 tensors")
+    if bias is not None:
+        torch._check(bias.device == a.device, lambda: "bias must be on the input device")
+        torch._check(
+            (bias.dim() == 1 and bias.size(0) == b.size(2))
+            or (bias.dim() == 2 and bias.size(0) == a.size(0) and bias.size(1) == b.size(2)),
+            lambda: "bias must have shape (N,) or (B, N)",
+        )
+
+
+def _scaled_bmm_scale_matches(s, batch, batched, recipe, outer, rhs):
+    if batched and (s.dim() == 0 or s.size(0) != batch):
+        return False
+    sizes = s.shape[1:] if batched else s.shape
+    if s.dtype != torch.float32:
+        return False
+    if recipe == 0:
+        return math.prod(sizes) == 1
+    return len(sizes) == 2 and sizes[1 if rhs else 0] == outer and sizes[0 if rhs else 1] == 1
+
+
+def _scaled_bmm_infer_scales(a, b, sa, sb):
+    torch._check(sa.device == a.device and sb.device == a.device, lambda: "scales must be on the input device")
+    result = None
+    for recipe in (0, 1):
+        for ba in (False, True):
+            for bb in (False, True):
+                if _scaled_bmm_scale_matches(sa, a.size(0), ba, recipe, a.size(1), False) and _scaled_bmm_scale_matches(sb, a.size(0), bb, recipe, b.size(2), True):
+                    candidate = (ba, bb)
+                    torch._check(
+                        result is None or result == candidate or a.size(0) == 1,
+                        lambda: "Ambiguous scale shapes for _scaled_bmm; add singleton dimensions or use explicit recipes with _scaled_bmm_v2",
+                    )
+                    if result is None:
+                        result = candidate
+    torch._check(result is not None, lambda: "Invalid scaling configuration for _scaled_bmm")
+    return result
+
+
+@register_meta([aten._scaled_bmm.default, aten._scaled_bmm.out])
+@out_wrapper()
+def meta_scaled_bmm(self, mat2, scale_a, scale_b, bias=None, scale_result=None, out_dtype=None, use_fast_accum=False):
+    _scaled_bmm_check_inputs(self, mat2, bias)
+    _scaled_bmm_infer_scales(self, mat2, scale_a, scale_b)
+    if scale_result is not None:
+        torch._check(
+            scale_result.device == self.device and scale_result.dtype == torch.float32
+            and (scale_result.numel() == 1 or (scale_result.dim() == 1 and scale_result.size(0) == self.size(0))),
+            lambda: "scale_result must be a Float scalar or have shape (B,) on the input device",
+        )
+    return self.new_empty((self.size(0), self.size(1), mat2.size(2)), dtype=out_dtype or self.dtype)
+
+
 @register_meta([aten._scaled_mm.default])
 def meta_scaled_mm(
     self: torch.Tensor,
