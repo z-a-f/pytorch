@@ -10,12 +10,14 @@ from torch.testing._internal.common_utils import HardwareClassification, instant
 
 
 class TestScaledBmm(TestCase):
-    hw_classification = HardwareClassification.CPU
+    hw_classification = HardwareClassification.ACCELERATOR
 
     def scaled_bmm(self, *args, **kwargs):
         return torch._scaled_bmm(*args, **kwargs)
 
     def inputs(self, device, batch=3, m=32, k=32, n=48):
+        if device.startswith("cuda") and not PLATFORM_SUPPORTS_FP8:
+            self.skipTest("FP8 hardware is required")
         a = torch.randn(batch, m, k, device=device).to(e4m3_type)
         b = torch.randn(batch, n, k, device=device).to(e4m3_type).transpose(1, 2)
         return a, b
@@ -96,7 +98,7 @@ class TestScaledBmm(TestCase):
 
 
 class TestScaledBmmV2(TestScaledBmm):
-    hw_classification = HardwareClassification.CPU
+    hw_classification = HardwareClassification.ACCELERATOR
     test_scales = TestScaledBmm.test_scales
     test_bias_and_out = TestScaledBmm.test_bias_and_out
     test_empty = TestScaledBmm.test_empty
@@ -138,15 +140,6 @@ class TestScaledBmmV2(TestScaledBmm):
                 torch._scaled_bmm_v2(a, b, scales, recipes, [], [scalar], [0], [], None, torch.bfloat16)
 
 
-@unittest.skipIf(not PLATFORM_SUPPORTS_FP8, "FP8 hardware is required")
-class TestScaledBmmCUDA(TestScaledBmm):
-    hw_classification = HardwareClassification.CUDA
-
-
-class TestScaledBmmXPU(TestScaledBmm):
-    hw_classification = HardwareClassification.XPU
-
-
 @instantiate_parametrized_tests
 class TestScaledBmmMeta(TestCase):
     hw_classification = HardwareClassification.GENERIC
@@ -186,10 +179,8 @@ class TestScaledBmmMeta(TestCase):
             self.assertEqual(result.dtype, torch.bfloat16)
 
 
-instantiate_device_type_tests(TestScaledBmm, globals(), only_for=("cpu",))
-instantiate_device_type_tests(TestScaledBmmV2, globals(), only_for=("cpu",))
-instantiate_device_type_tests(TestScaledBmmCUDA, globals(), only_for=("cuda",))
-instantiate_device_type_tests(TestScaledBmmXPU, globals(), only_for=("xpu",))
+instantiate_device_type_tests(TestScaledBmm, globals(), except_for=("mps", "xpu"))
+instantiate_device_type_tests(TestScaledBmmV2, globals(), except_for=("mps", "xpu"))
 
 if __name__ == "__main__":
     run_tests()
