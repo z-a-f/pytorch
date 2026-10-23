@@ -7113,13 +7113,13 @@
 - func: _scaled_bmm(Tensor self, Tensor mat2, Tensor scale_a, Tensor scale_b, Tensor? bias=None, Tensor? scale_result=None, ScalarType? out_dtype=None, bool use_fast_accum=False) -> Tensor
   variants: function
   dispatch:
-    CPU: _scaled_bmm
+    CPU, CUDA: _scaled_bmm
   tags: needs_exact_strides
 
 - func: _scaled_bmm.out(Tensor self, Tensor mat2, Tensor scale_a, Tensor scale_b, Tensor? bias=None, Tensor? scale_result=None, ScalarType? out_dtype=None, bool use_fast_accum=False, *, Tensor(a!) out) -> Tensor(a!)
   variants: function
   dispatch:
-    CPU: _scaled_bmm_out
+    CPU, CUDA: _scaled_bmm_out
   tags: needs_exact_strides
 
 - func: _scaled_mm(Tensor self, Tensor mat2, Tensor scale_a, Tensor scale_b, Tensor? bias=None, Tensor? scale_result=None, ScalarType? out_dtype=None, bool use_fast_accum=False) -> Tensor

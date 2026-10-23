@@ -1,9 +1,11 @@
 # Owner(s): ["module: linear algebra"]
 import itertools
+import unittest
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FP8
+from torch.testing._internal.common_device_type import e4m3_type, instantiate_device_type_tests
 from torch.testing._internal.common_utils import HardwareClassification, instantiate_parametrized_tests, parametrize, run_tests, TestCase
 
 
@@ -11,13 +13,15 @@ class TestScaledBmm(TestCase):
     hw_classification = HardwareClassification.CPU
 
     def inputs(self, device, batch=3, m=32, k=32, n=48):
-        a = torch.randn(batch, m, k, device=device).to(torch.float8_e4m3fn)
-        b = torch.randn(batch, n, k, device=device).to(torch.float8_e4m3fn).transpose(1, 2)
+        a = torch.randn(batch, m, k, device=device).to(e4m3_type)
+        b = torch.randn(batch, n, k, device=device).to(e4m3_type).transpose(1, 2)
         return a, b
 
     @parametrize("batch", [0, 1, 3])
     @parametrize("rowwise", [False, True])
     def test_scales(self, device, batch, rowwise):
+        if rowwise and device.startswith("cuda") and not torch.version.hip and torch.cuda.get_device_capability()[0] < 9:
+            self.skipTest("Rowwise FP8 requires SM90 or later")
         a, b = self.inputs(device, batch)
         for ba, bb in itertools.product((False, True), repeat=2):
             sa_shape = (32, 1) if rowwise else ()
@@ -86,6 +90,11 @@ class TestScaledBmm(TestCase):
         self.assertEqual(actual.shape, (32, 32, 32))
 
 
+@unittest.skipIf(not PLATFORM_SUPPORTS_FP8, "FP8 hardware is required")
+class TestScaledBmmCUDA(TestScaledBmm):
+    hw_classification = HardwareClassification.CUDA
+
+
 @instantiate_parametrized_tests
 class TestScaledBmmMeta(TestCase):
     hw_classification = HardwareClassification.GENERIC
@@ -102,7 +111,19 @@ class TestScaledBmmMeta(TestCase):
             self.assertEqual(result.dtype, torch.bfloat16)
 
 
+    @parametrize("dtype", [torch.float8_e8m0fnu, torch.float8_e4m3fn])
+    def test_block_scales(self, dtype):
+        with torch.device("meta"):
+            input_dtype = torch.float8_e4m3fn if dtype == torch.float8_e8m0fnu else torch.float4_e2m1fn_x2
+            a = torch.empty(3, 32, 32, dtype=input_dtype)
+            b = torch.empty(3, 48, 32, dtype=input_dtype).transpose(1, 2)
+            scales = torch.empty(3, 512, dtype=dtype)
+            result = torch._scaled_bmm(a, b, scales, scales, out_dtype=torch.bfloat16)
+            self.assertEqual(result.shape, (3, 32, 48))
+
+
 instantiate_device_type_tests(TestScaledBmm, globals(), only_for=("cpu",))
+instantiate_device_type_tests(TestScaledBmmCUDA, globals(), only_for=("cuda",))
 
 if __name__ == "__main__":
     run_tests()

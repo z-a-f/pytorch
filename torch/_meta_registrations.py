@@ -7539,7 +7539,7 @@ def _scaled_bmm_check_inputs(a, b, bias):
     torch._check(a.size(0) == b.size(0), lambda: "_scaled_bmm inputs must have the same batch size")
     torch._check(a.size(2) == b.size(1), lambda: "_scaled_bmm contraction dimensions must match")
     torch._check(a.device == b.device, lambda: "_scaled_bmm inputs must be on the same device")
-    torch._check(a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz) and b.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz), lambda: "_scaled_bmm inputs must be Float8 tensors")
+    torch._check(a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz, torch.float4_e2m1fn_x2) and b.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz, torch.float4_e2m1fn_x2), lambda: "_scaled_bmm inputs must be Float8 or Float4 tensors")
     if bias is not None:
         torch._check(bias.device == a.device, lambda: "bias must be on the input device")
         torch._check(
@@ -7549,24 +7549,48 @@ def _scaled_bmm_check_inputs(a, b, bias):
         )
 
 
-def _scaled_bmm_scale_matches(s, batch, batched, recipe, outer, rhs):
+def _scaled_bmm_scale_matches(s, batch, batched, recipe, outer, rhs, k, xpu, packed, swizzle=0, explicit_recipe=False):
     if batched and (s.dim() == 0 or s.size(0) != batch):
         return False
     sizes = s.shape[1:] if batched else s.shape
-    if s.dtype != torch.float32:
-        return False
+    numel = math.prod(sizes)
     if recipe == 0:
-        return math.prod(sizes) == 1
-    return len(sizes) == 2 and sizes[1 if rhs else 0] == outer and sizes[0 if rhs else 1] == 1
+        return s.dtype == torch.float32 and numel == 1
+    if recipe == 1:
+        return s.dtype == torch.float32 and (
+            (len(sizes) == 2 and sizes[1 if rhs else 0] == outer and sizes[0 if rhs else 1] == 1)
+            or (explicit_recipe and len(sizes) == 1 and numel == outer)
+        )
+    if recipe in (4, 5):
+        rows = outer if recipe == 4 else ceil_div(outer, 128)
+        return s.dtype == torch.float32 and len(sizes) == 2 and sizes[1 if rhs else 0] == rows and sizes[0 if rhs else 1] == ceil_div(k, 128)
+    if recipe == 3:
+        dtype = torch.float8_e8m0fnu
+        if xpu:
+            expected = outer * ceil_div(k, 32)
+        elif torch.version.hip:
+            expected = round_up(outer, 32) * round_up(ceil_div(k, 32), 8) if swizzle == 2 else ceil_div(outer * (2 if packed else 1), 32) * (k // 2 if packed else k)
+        else:
+            expected = round_up(outer, 128) * round_up(ceil_div(k, 32), 4)
+    elif recipe == 2:
+        dtype = torch.float8_e4m3fn
+        expected = outer * ceil_div(k, 16) if xpu else round_up(outer, 128) * round_up(ceil_div(k, 16), 4)
+    else:
+        return False
+    return s.dtype == dtype and numel == expected
+
 
 
 def _scaled_bmm_infer_scales(a, b, sa, sb):
     torch._check(sa.device == a.device and sb.device == a.device, lambda: "scales must be on the input device")
     result = None
-    for recipe in (0, 1):
+    packed = a.dtype == torch.float4_e2m1fn_x2
+    k = a.size(2) * (2 if packed else 1)
+    xpu = device_hint(a) == "xpu"
+    for recipe_a, recipe_b in ((0, 0), (1, 1), (5, 4), (4, 5), (4, 4), (3, 3), (2, 2)):
         for ba in (False, True):
             for bb in (False, True):
-                if _scaled_bmm_scale_matches(sa, a.size(0), ba, recipe, a.size(1), False) and _scaled_bmm_scale_matches(sb, a.size(0), bb, recipe, b.size(2), True):
+                if _scaled_bmm_scale_matches(sa, a.size(0), ba, recipe_a, a.size(1), False, k, xpu, packed) and _scaled_bmm_scale_matches(sb, a.size(0), bb, recipe_b, b.size(2), True, k, xpu, packed):
                     candidate = (ba, bb)
                     torch._check(
                         result is None or result == candidate or a.size(0) == 1,
