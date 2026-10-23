@@ -7327,6 +7327,78 @@ def scaled_mm(
     return out
 
 
+def scaled_bmm(
+    mat_a: Tensor,
+    mat_b: Tensor,
+    scale_a: Tensor | list[Tensor],
+    scale_recipe_a: ScalingType | list[ScalingType],
+    scale_b: Tensor | list[Tensor],
+    scale_recipe_b: ScalingType | list[ScalingType],
+    swizzle_a: SwizzleType | list[SwizzleType] | None = None,
+    swizzle_b: SwizzleType | list[SwizzleType] | None = None,
+    bias: Tensor | None = None,
+    output_dtype: torch.dtype | None = torch.bfloat16,
+    contraction_dim: list[int] | tuple[int, ...] = (),
+    use_fast_accum: bool = False,
+) -> Tensor:
+    r"""
+    scaled_bmm(mat_a, mat_b, scale_a, scale_recipe_a, scale_b, scale_recipe_b, swizzle_a, swizzle_b, bias, output_dtype,
+              contraction_dim, use_fast_accum)
+
+    Applies a scaled matrix-multiply, bmm(mat_a, mat_b) where the scaling of mat_a and mat_b are described by
+    scale_recipe_a and scale_recipe_b respectively.
+
+    Both inputs must be 3D and have the same batch size. Scales may use the
+    corresponding :func:`scaled_mm` layout shared across all batches, or that
+    layout with a leading batch dimension. Each scale in a multilevel recipe
+    may independently be shared or batched. For example, tensorwise scales can
+    be scalar or ``(B,)``; rowwise scales can be ``(M, 1)`` / ``(1, N)`` or
+    ``(B, M, 1)`` / ``(B, 1, N)``. Ambiguous layouts require extra singleton
+    dimensions. Swizzling applies separately to each batch item's scales.
+
+    Bias may have shape ``(N,)`` or ``(B, N)``. The output has shape
+    ``(B, M, N)``. Supported recipes, dtypes, and layouts depend on the backend
+    and match :func:`scaled_mm`. Automatic differentiation is not supported.
+
+    Args:
+        scale_a: Tensor containing decoding scaling factors for mat_a
+        scale_recipe_a: Enum describing how mat_a has been scaled
+        scale_b: Tensor containing decoding scaling factors for mat_b
+        scale_recipe_b: Enum describing how mat_b has been scaled
+        swizzle_a: Enum describing the swizzling pattern (if any) of scale_a
+        swizzle_b: Enum describing the swizzling pattern (if any) of scale_b
+        bias: optional bias term to be added to the output
+        output_dtype: dtype used for the output tensor
+        contraction_dim: Must be empty or ``(2, 1)`` (equivalent negative
+            dimensions are also accepted).
+        use_fast_accum: enable/disable tensor-core fast accumulation (Hopper-GPUs only)
+    """
+
+    scale_a = _expand_single_value(scale_a)
+    scale_recipe_a = _expand_single_value(scale_recipe_a)
+    scale_b = _expand_single_value(scale_b)
+    scale_recipe_b = _expand_single_value(scale_recipe_b)
+    swizzle_a = _expand_single_value(swizzle_a)
+    swizzle_b = _expand_single_value(swizzle_b)
+
+    out = torch._scaled_bmm_v2(
+        mat_a,
+        mat_b,
+        scale_a,
+        _enum_list_as_int_list(scale_recipe_a),
+        _enum_list_as_int_list(_list_or_empty(swizzle_a)),
+        scale_b,
+        _enum_list_as_int_list(scale_recipe_b),
+        _enum_list_as_int_list(_list_or_empty(swizzle_b)),
+        bias,
+        output_dtype,
+        contraction_dim,
+        use_fast_accum,
+    )
+
+    return out
+
+
 def scaled_addmm(
     input: Tensor,
     mat1: Tensor,

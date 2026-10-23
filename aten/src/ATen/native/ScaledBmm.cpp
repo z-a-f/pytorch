@@ -13,6 +13,9 @@
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/_scaled_bmm_native.h>
+#include <ATen/ops/_scaled_bmm_v2_native.h>
+#include <ATen/ops/_scaled_mm_v2.h>
+#include <ATen/ops/empty_strided.h>
 #include <ATen/ops/_scaled_mm.h>
 #include <ATen/ops/empty.h>
 #endif
@@ -122,6 +125,55 @@ std::pair<bool, bool> infer_scales(const Tensor& a, const Tensor& b,
   return *result;
 }
 
+std::vector<bool> explicit_scale_modes(const Tensor& a, const Tensor& b,
+    TensorList scales, IntArrayRef recipes, IntArrayRef swizzles, bool rhs) {
+  TORCH_CHECK(!recipes.empty() && scales.size() == recipes.size(),
+      "scale tensors must match the number of recipes");
+  TORCH_CHECK(swizzles.empty() || swizzles.size() == recipes.size(),
+      "swizzles must be empty or match the number of recipes");
+  std::vector<bool> modes;
+  const bool packed = a.scalar_type() == kFloat4_e2m1fn_x2;
+  const auto k = a.size(2) * (packed ? 2 : 1);
+  for (const auto i : c10::irange(scales.size())) {
+    const auto& scale = scales[i];
+    TORCH_CHECK(scale.device() == a.device(), "scales must be on the input device");
+    const auto recipe = static_cast<ScalingType>(recipes[i]);
+    const auto swizzle = swizzles.empty() ? 0 : swizzles[i];
+    const auto outer = rhs ? b.size(2) : a.size(1);
+    const bool shared = scale_matches(scale, a.size(0), false, recipe, outer, rhs,
+        k, a.is_xpu(), packed, swizzle, true);
+    const bool batched = scale_matches(scale, a.size(0), true, recipe, outer, rhs,
+        k, a.is_xpu(), packed, swizzle, true);
+    TORCH_CHECK(shared || batched, "Invalid scale shape or dtype for _scaled_bmm_v2 recipe ", recipes[i]);
+    TORCH_CHECK(!shared || !batched || a.size(0) == 1,
+        "Ambiguous scale shape for _scaled_bmm_v2; add singleton dimensions");
+    modes.push_back(!shared);
+  }
+  return modes;
+}
+
+Tensor matrix_metadata(const Tensor& t, bool batched) {
+  const auto offset = batched ? 1 : 0;
+  return at::empty_strided(t.sizes().slice(offset), t.strides().slice(offset),
+      t.options().device(kMeta));
+}
+
+std::vector<Tensor> scale_metadata(TensorList scales, const std::vector<bool>& modes) {
+  std::vector<Tensor> result;
+  for (const auto i : c10::irange(scales.size())) {
+    result.push_back(matrix_metadata(scales[i], modes[i]));
+  }
+  return result;
+}
+
+std::vector<Tensor> batch_scales(TensorList scales, const std::vector<bool>& modes, int64_t i) {
+  std::vector<Tensor> result;
+  for (const auto j : c10::irange(scales.size())) {
+    result.push_back(modes[j] ? scales[j].select(0, i) : scales[j]);
+  }
+  return result;
+}
+
 } // namespace
 
 Tensor& _scaled_bmm_out(const Tensor& self, const Tensor& mat2,
@@ -169,6 +221,61 @@ Tensor _scaled_bmm(const Tensor& self, const Tensor& mat2,
   auto out = at::empty({0}, self.options().dtype(out_dtype.value_or(self.scalar_type())));
   return _scaled_bmm_out(self, mat2, scale_a, scale_b, bias, scale_result,
       out_dtype, use_fast_accum, out);
+}
+
+Tensor& _scaled_bmm_v2_out(const Tensor& self, const Tensor& mat2,
+    TensorList scale_a, IntArrayRef recipe_a, IntArrayRef swizzle_a,
+    TensorList scale_b, IntArrayRef recipe_b, IntArrayRef swizzle_b,
+    const std::optional<Tensor>& bias, std::optional<ScalarType> out_dtype,
+    IntArrayRef contraction_dim, bool use_fast_accum, Tensor& out) {
+  check_inputs(self, mat2, bias);
+  TORCH_CHECK(contraction_dim.empty() || (contraction_dim.size() == 2 &&
+      (contraction_dim[0] == 2 || contraction_dim[0] == -1) &&
+      (contraction_dim[1] == 1 || contraction_dim[1] == -2)),
+      "_scaled_bmm_v2 only supports contraction_dim=(2, 1)");
+  const auto modes_a = explicit_scale_modes(self, mat2, scale_a, recipe_a, swizzle_a, false);
+  const auto modes_b = explicit_scale_modes(self, mat2, scale_b, recipe_b, swizzle_b, true);
+  const auto recipes_a = scaled::convert_int_to_enum<ScalingType>(recipe_a);
+  const auto recipes_b = scaled::convert_int_to_enum<ScalingType>(recipe_b);
+  const auto swizzles_a = scaled::convert_int_to_enum<at::blas::SwizzleType>(swizzle_a);
+  const auto swizzles_b = scaled::convert_int_to_enum<at::blas::SwizzleType>(swizzle_b);
+  scaled::validate_scaled_mm_v2_inputs(matrix_metadata(self, true), matrix_metadata(mat2, true),
+      scale_metadata(scale_a, modes_a), recipes_a, swizzles_a,
+      scale_metadata(scale_b, modes_b), recipes_b, swizzles_b, self.device().type());
+  TORCH_CHECK(out.device() == self.device(), "out must be on the input device");
+  TORCH_CHECK(!out_dtype || *out_dtype == out.scalar_type(), "out_dtype must match output matrix type");
+  assert_no_internal_overlap(out);
+  assert_no_overlap(out, self);
+  assert_no_overlap(out, mat2);
+  for (const auto& scale : scale_a) {
+    assert_no_overlap(out, scale);
+  }
+  for (const auto& scale : scale_b) {
+    assert_no_overlap(out, scale);
+  }
+  if (bias) {
+    assert_no_overlap(out, *bias);
+  }
+  resize_output(out, {self.size(0), self.size(1), mat2.size(2)});
+  for (const auto i : c10::irange(self.size(0))) {
+    const auto bias_i = bias && bias->dim() == 2 ? std::optional<Tensor>(bias->select(0, i)) : bias;
+    auto output = out.select(0, i);
+    output.copy_(at::_scaled_mm_v2(self.select(0, i), mat2.select(0, i),
+        batch_scales(scale_a, modes_a, i), recipe_a, swizzle_a,
+        batch_scales(scale_b, modes_b, i), recipe_b, swizzle_b,
+        bias_i, out.scalar_type(), {}, use_fast_accum));
+  }
+  return out;
+}
+
+Tensor _scaled_bmm_v2(const Tensor& self, const Tensor& mat2,
+    TensorList scale_a, IntArrayRef recipe_a, IntArrayRef swizzle_a,
+    TensorList scale_b, IntArrayRef recipe_b, IntArrayRef swizzle_b,
+    const std::optional<Tensor>& bias, std::optional<ScalarType> out_dtype,
+    IntArrayRef contraction_dim, bool use_fast_accum) {
+  auto out = at::empty({0}, self.options().dtype(out_dtype.value_or(self.scalar_type())));
+  return _scaled_bmm_v2_out(self, mat2, scale_a, recipe_a, swizzle_a,
+      scale_b, recipe_b, swizzle_b, bias, out_dtype, contraction_dim, use_fast_accum, out);
 }
 
 } // namespace at::native

@@ -7616,6 +7616,46 @@ def meta_scaled_bmm(self, mat2, scale_a, scale_b, bias=None, scale_result=None, 
     return self.new_empty((self.size(0), self.size(1), mat2.size(2)), dtype=out_dtype or self.dtype)
 
 
+def _scaled_bmm_explicit_modes(a, b, scales, recipes, swizzles, rhs):
+    torch._check(bool(recipes) and len(scales) == len(recipes), lambda: "scale tensors must match the number of recipes")
+    torch._check(not swizzles or len(swizzles) == len(recipes), lambda: "swizzles must be empty or match the number of recipes")
+    packed = a.dtype == torch.float4_e2m1fn_x2
+    k = a.size(2) * (2 if packed else 1)
+    modes = []
+    for i, (scale, recipe) in enumerate(zip(scales, recipes)):
+        torch._check(scale.device == a.device, lambda: "scales must be on the input device")
+        args = (recipe, b.size(2) if rhs else a.size(1), rhs, k, device_hint(a) == "xpu", packed, swizzles[i] if swizzles else 0, True)
+        shared = _scaled_bmm_scale_matches(scale, a.size(0), False, *args)
+        batched = _scaled_bmm_scale_matches(scale, a.size(0), True, *args)
+        torch._check(shared or batched, lambda: "Invalid scale shape or dtype for _scaled_bmm_v2 recipe")
+        torch._check(not shared or not batched or a.size(0) == 1, lambda: "Ambiguous scale shape for _scaled_bmm_v2; add singleton dimensions")
+        modes.append(not shared)
+    return modes
+
+
+@register_meta([aten._scaled_bmm_v2.default, aten._scaled_bmm_v2.out])
+@out_wrapper()
+def meta_scaled_bmm_v2(self, mat2, scale_a, recipe_a, swizzle_a, scale_b, recipe_b, swizzle_b, bias, out_dtype, contraction_dim=(), use_fast_accum=False):
+    _scaled_bmm_check_inputs(self, mat2, bias)
+    torch._check(
+        not contraction_dim or (len(contraction_dim) == 2 and contraction_dim[0] in (2, -1) and contraction_dim[1] in (1, -2)),
+        lambda: "_scaled_bmm_v2 only supports contraction_dim=(2, 1)",
+    )
+    _scaled_bmm_explicit_modes(self, mat2, scale_a, recipe_a, swizzle_a, False)
+    _scaled_bmm_explicit_modes(self, mat2, scale_b, recipe_b, swizzle_b, True)
+    pairs = (((0,), (0,)), ((1,), (1,)), ((5,), (4,)), ((4,), (5,)), ((4,), (4,)), ((3,), (3,)), ((2,), (2,)), ((2, 0), (2, 0)))
+    torch._check((tuple(recipe_a), tuple(recipe_b)) in pairs, lambda: "Invalid scaling configuration for _scaled_bmm_v2: unsupported recipe(s)")
+    if recipe_a[0] in (2, 3):
+        if device_hint(self) == "xpu":
+            torch._check(all(s == 0 for s in (*swizzle_a, *swizzle_b)), lambda: "XPU block scales require NO_SWIZZLE")
+        elif torch.version.hip:
+            if recipe_a[0] == 3:
+                torch._check(len(swizzle_a) == 1 and swizzle_a == swizzle_b and swizzle_a[0] in (0, 2), lambda: "ROCm MX scales require matching NO_SWIZZLE or SWIZZLE_32_8")
+        else:
+            torch._check(len(swizzle_a) == len(recipe_a) and len(swizzle_b) == len(recipe_b) and swizzle_a[0] == swizzle_b[0] == 1, lambda: "Block scales must be swizzled to SWIZZLE_32_4_4 format")
+    return self.new_empty((self.size(0), self.size(1), mat2.size(2)), dtype=out_dtype or self.dtype)
+
+
 @register_meta([aten._scaled_mm.default])
 def meta_scaled_mm(
     self: torch.Tensor,

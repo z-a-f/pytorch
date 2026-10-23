@@ -12,6 +12,9 @@ from torch.testing._internal.common_utils import HardwareClassification, instant
 class TestScaledBmm(TestCase):
     hw_classification = HardwareClassification.CPU
 
+    def scaled_bmm(self, *args, **kwargs):
+        return torch._scaled_bmm(*args, **kwargs)
+
     def inputs(self, device, batch=3, m=32, k=32, n=48):
         a = torch.randn(batch, m, k, device=device).to(e4m3_type)
         b = torch.randn(batch, n, k, device=device).to(e4m3_type).transpose(1, 2)
@@ -28,7 +31,7 @@ class TestScaledBmm(TestCase):
             sb_shape = (1, 48) if rowwise else ()
             sa = torch.rand(((batch,) if ba else ()) + sa_shape, device=device) + 0.5
             sb = torch.rand(((batch,) if bb else ()) + sb_shape, device=device) + 0.5
-            actual = torch._scaled_bmm(a, b, sa, sb, out_dtype=torch.bfloat16)
+            actual = self.scaled_bmm(a, b, sa, sb, out_dtype=torch.bfloat16)
             expected = torch.empty(batch, 32, 48, device=device, dtype=torch.bfloat16)
             for i in range(batch):
                 expected[i] = torch._scaled_mm(a[i], b[i], sa[i] if ba else sa, sb[i] if bb else sb, out_dtype=torch.bfloat16)
@@ -44,22 +47,22 @@ class TestScaledBmm(TestCase):
         scale = torch.ones((), device=device)
         bias = torch.randn((3, 48) if per_batch else (48,), device=device, dtype=torch.bfloat16)
         out = torch.empty(3, 48, 32, device=device, dtype=torch.bfloat16).transpose(1, 2)
-        result = torch._scaled_bmm(a, b, scale, scale, bias=bias, out=out)
+        result = self.scaled_bmm(a, b, scale, scale, bias=bias, out=out)
         self.assertIs(result, out)
         expected = torch.stack([torch._scaled_mm(a[i], b[i], scale, scale, bias=bias[i] if per_batch else bias, out_dtype=torch.bfloat16) for i in range(3)])
         self.assertEqual(result, expected)
         resized = torch.empty(0, device=device, dtype=torch.bfloat16)
-        torch._scaled_bmm(a, b, scale, scale, out=resized)
+        self.scaled_bmm(a, b, scale, scale, out=resized)
         self.assertEqual(resized.shape, (3, 32, 48))
         with self.assertRaisesRegex(RuntimeError, "out_dtype must match"):
-            torch._scaled_bmm(a, b, scale, scale, out=resized, out_dtype=torch.float16)
+            self.scaled_bmm(a, b, scale, scale, out=resized, out_dtype=torch.float16)
 
     @parametrize("shape", [(3, 0, 32, 48), (3, 32, 0, 48), (3, 32, 32, 0)])
     def test_empty(self, device, shape):
         batch, m, k, n = shape
         a, b = self.inputs(device, batch, m, k, n)
         scale = torch.ones((), device=device)
-        result = torch._scaled_bmm(a, b, scale, scale, out_dtype=torch.bfloat16)
+        result = self.scaled_bmm(a, b, scale, scale, out_dtype=torch.bfloat16)
         self.assertEqual(result, torch.zeros(batch, m, n, device=device, dtype=torch.bfloat16))
 
     def test_invalid(self, device):
@@ -70,24 +73,69 @@ class TestScaledBmm(TestCase):
             (a, b[:1], scale, scale, "same batch size"),
             (a, b[:, :16], scale, scale, "contraction dimensions"),
             (a.float(), b, scale, scale, "Float8"),
-            (a, b, torch.ones(2, device=device), scale, "Invalid scaling"),
+            (a, b, torch.ones(2, device=device), scale, "Invalid scal"),
         ]
         for aa, bb, sa, sb, error in cases:
             with self.assertRaisesRegex(RuntimeError, error):
-                torch._scaled_bmm(aa, bb, sa, sb)
+                self.scaled_bmm(aa, bb, sa, sb)
         with self.assertRaisesRegex(RuntimeError, "bias must have shape"):
-            torch._scaled_bmm(a, b, scale, scale, bias=torch.zeros(2, device=device))
+            self.scaled_bmm(a, b, scale, scale, bias=torch.zeros(2, device=device))
 
     def test_ambiguous(self, device):
+        if device.startswith("cuda") and not torch.version.hip and torch.cuda.get_device_capability()[0] < 9:
+            self.skipTest("Rowwise FP8 requires SM90 or later")
         a, b = self.inputs(device, batch=32, m=32, n=32)
         sa = torch.ones(32, 1, device=device)
         sb = torch.ones(32, 1, 32, device=device)
         # Rowwise A can also be interpreted as per-batch scalar A when B=M.
         # Both sides must form a valid pair before it is ambiguous.
         with self.assertRaisesRegex(RuntimeError, "Ambiguous"):
-            torch._scaled_bmm(a, b[:, :, :1], sa, torch.ones(1, 1, device=device))
-        actual = torch._scaled_bmm(a, b, sa.unsqueeze(0).expand(32, -1, -1), sb, out_dtype=torch.bfloat16)
+            self.scaled_bmm(a, b[:, :, :1], sa, torch.ones(1, 1, device=device))
+        actual = self.scaled_bmm(a, b, sa.unsqueeze(0).expand(32, -1, -1), sb, out_dtype=torch.bfloat16)
         self.assertEqual(actual.shape, (32, 32, 32))
+
+
+class TestScaledBmmV2(TestScaledBmm):
+    hw_classification = HardwareClassification.CPU
+    test_scales = TestScaledBmm.test_scales
+    test_bias_and_out = TestScaledBmm.test_bias_and_out
+    test_empty = TestScaledBmm.test_empty
+    test_invalid = TestScaledBmm.test_invalid
+
+    def scaled_bmm(self, a, b, sa, sb, bias=None, out_dtype=None, use_fast_accum=False, **kwargs):
+        rowwise = sa.dim() >= 2 and sa.shape[-2:] == (a.size(1), 1) and sa.numel() != 1
+        recipe = [1 if rowwise else 0]
+        return torch._scaled_bmm_v2(a, b, [sa], recipe, [], [sb], recipe, [], bias, out_dtype, use_fast_accum=use_fast_accum, **kwargs)
+
+    def test_ambiguous(self, device):
+        if device.startswith("cuda") and not torch.version.hip and torch.cuda.get_device_capability()[0] < 9:
+            self.skipTest("Rowwise FP8 requires SM90 or later")
+        a, b = self.inputs(device, batch=32, m=32, n=32)
+        sa = torch.ones(32, 1, device=device)
+        scalar = torch.ones((), device=device)
+        actual = torch._scaled_bmm_v2(a, b, [sa], [0], [], [scalar], [0], [], None, torch.bfloat16)
+        expected = torch.stack([torch._scaled_mm(a[i], b[i], sa[i], scalar, out_dtype=torch.bfloat16) for i in range(32)])
+        self.assertEqual(actual, expected)
+        actual = torch._scaled_bmm_v2(a, b, [sa], [1], [], [sa.t()], [1], [], None, torch.bfloat16)
+        expected = torch.stack([torch._scaled_mm(a[i], b[i], sa, sa.t(), out_dtype=torch.bfloat16) for i in range(32)])
+        self.assertEqual(actual, expected)
+
+    @parametrize("contraction_dim", [(), (2, 1), (-1, -2)])
+    def test_functional(self, device, contraction_dim):
+        a, b = self.inputs(device)
+        sa = torch.rand(3, device=device)
+        sb = torch.ones((), device=device)
+        result = torch.nn.functional.scaled_bmm(a, b, sa, torch.nn.functional.ScalingType.TensorWise, sb, torch.nn.functional.ScalingType.TensorWise, contraction_dim=contraction_dim)
+        self.assertEqual(result, self.scaled_bmm(a, b, sa, sb, out_dtype=torch.bfloat16))
+        with self.assertRaisesRegex(RuntimeError, "contraction_dim"):
+            torch._scaled_bmm_v2(a, b, [sa], [0], [], [sb], [0], [], None, torch.bfloat16, [1, 0])
+
+    def test_invalid_recipes(self, device):
+        a, b = self.inputs(device, batch=0)
+        scalar = torch.ones((), device=device)
+        for recipes, scales, error in [([], [], "number of recipes"), ([99], [scalar], "Invalid scale"), ([0, 0], [scalar], "number of recipes")]:
+            with self.assertRaisesRegex(RuntimeError, error):
+                torch._scaled_bmm_v2(a, b, scales, recipes, [], [scalar], [0], [], None, torch.bfloat16)
 
 
 @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, "FP8 hardware is required")
@@ -126,7 +174,20 @@ class TestScaledBmmMeta(TestCase):
             self.assertEqual(result.shape, (3, 32, 48))
 
 
+    @parametrize("fake", [False, True])
+    def test_v2_meta(self, fake):
+        with FakeTensorMode() if fake else torch.device("meta"):
+            a = torch.empty(3, 32, 32, dtype=torch.float8_e4m3fn)
+            b = torch.empty(3, 48, 32, dtype=torch.float8_e4m3fn).transpose(1, 2)
+            sa = torch.ones(3)
+            sb = torch.ones(())
+            result = torch._scaled_bmm_v2(a, b, [sa], [0], [], [sb], [0], [], None, torch.bfloat16)
+            self.assertEqual(result.shape, (3, 32, 48))
+            self.assertEqual(result.dtype, torch.bfloat16)
+
+
 instantiate_device_type_tests(TestScaledBmm, globals(), only_for=("cpu",))
+instantiate_device_type_tests(TestScaledBmmV2, globals(), only_for=("cpu",))
 instantiate_device_type_tests(TestScaledBmmCUDA, globals(), only_for=("cuda",))
 instantiate_device_type_tests(TestScaledBmmXPU, globals(), only_for=("xpu",))
 

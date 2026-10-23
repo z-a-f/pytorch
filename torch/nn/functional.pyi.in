@@ -751,6 +751,23 @@ def scaled_mm(
 
 __all__ += ["scaled_mm"]
 
+def scaled_bmm(
+    mat_a: Tensor,
+    mat_b: Tensor,
+    scale_a: Tensor | list[Tensor],
+    scale_recipe_a: ScalingType | list[ScalingType],
+    scale_b: Tensor | list[Tensor],
+    scale_recipe_b: ScalingType | list[ScalingType],
+    swizzle_a: SwizzleType | list[SwizzleType] | None = None,
+    swizzle_b: SwizzleType | list[SwizzleType] | None = None,
+    bias: Tensor | None = None,
+    output_dtype: _dtype = ...,
+    contraction_dim: list[int] | tuple[int, ...] = (),
+    use_fast_accum: bool = False,
+) -> Tensor: ...
+
+__all__ += ["scaled_bmm"]
+
 def scaled_addmm(
     input: Tensor,
     mat1: Tensor,

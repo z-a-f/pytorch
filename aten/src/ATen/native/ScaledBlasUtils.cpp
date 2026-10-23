@@ -303,7 +303,8 @@ void validate_scaled_mm_v2_inputs(
     ArrayRef<SwizzleType> swizzle_a,
     ArrayRef<Tensor> scale_b,
     ArrayRef<ScalingType> recipe_b,
-    ArrayRef<SwizzleType> swizzle_b) {
+    ArrayRef<SwizzleType> swizzle_b,
+    std::optional<c10::DeviceType> device_type) {
   TORCH_CHECK_VALUE(
       is_fp8_or_fp4_type(mat_a.scalar_type()) && is_fp8_or_fp4_type(mat_b.scalar_type()),
       "Expected both inputs to be fp8 or fp4 types but got mat_a.dtype=",
@@ -317,7 +318,7 @@ void validate_scaled_mm_v2_inputs(
   const auto K_unpacked = both_fp4 ? mat_a.sym_size(1) * 2 : mat_a.sym_size(1);
   // XPU (oneDNN) uses unswizzled, unpadded blockwise scale shapes, unlike the
   // L4-padded SWIZZLE_32_4_4 layout that CUDA expects.
-  const bool is_xpu = mat_a.is_xpu();
+  const bool is_xpu = device_type.value_or(mat_a.device().type()) == kXPU;
 
   auto sym_ceil_div = [](const c10::SymInt& a, int64_t b) {
     return (a + b - 1) / b;

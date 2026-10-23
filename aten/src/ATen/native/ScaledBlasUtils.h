@@ -197,7 +197,8 @@ void validate_scaled_mm_v2_inputs(
     ArrayRef<SwizzleType> swizzle_a,
     ArrayRef<Tensor> scale_b,
     ArrayRef<ScalingType> recipe_b,
-    ArrayRef<SwizzleType> swizzle_b);
+    ArrayRef<SwizzleType> swizzle_b,
+    std::optional<c10::DeviceType> device_type = std::nullopt);
 
 /**
  * Validate the basic (recipe-independent) inputs of `_scaled_grouped_mm_v2`.
